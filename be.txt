@@ -1,0 +1,179 @@
+// Node.js Express controller and routes for Loans
+// Uses MongoDB via Mongoose. Swap out the model layer if needed.
+
+// npm i express mongoose jsonwebtoken
+const mongoose = require('mongoose')
+const jwt = require('jsonwebtoken')
+
+// ----- Model (keep here for portability) -----
+const LoanSchema = new mongoose.Schema(
+  {
+    user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true, required: true },
+    amount: { type: Number, required: true },
+    apr: { type: Number, required: true }, // Annual percentage rate
+    durationDays: { type: Number, required: true },
+    collateral: { type: String, required: true },
+    startDate: { type: Date, required: true },
+    dueDate: { type: Date, required: true },
+    balance: { type: Number, required: true },
+    status: { type: String, enum: ['Active', 'Repaid', 'Overdue'], default: 'Active' },
+  },
+  { timestamps: true }
+)
+
+// Prevent model overwrite in dev hot-reload
+const Loan = mongoose.models.Loan || mongoose.model('Loan', LoanSchema)
+
+// ----- Helpers -----
+function jsonOk(res, data, status = 200) {
+  return res.status(status).json({ success: true, data })
+}
+
+function jsonErr(res, message, status = 400) {
+  return res.status(status).json({ success: false, message })
+}
+
+function getUserId(req) {
+  if (req.user && (req.user.id || req.user._id)) return req.user.id || req.user._id
+  const auth = req.headers.authorization || ''
+  if (!auth.startsWith('Bearer ')) return null
+  const token = auth.slice(7)
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'change-me')
+    return decoded.id || decoded.userId || decoded.sub || null
+  } catch (e) {
+    return null
+  }
+}
+
+// Map of valid offers -> APR by duration
+const OFFER_APR = {
+  BTC: { 30: 12, 90: 15, 180: 20 },
+  ETH: { 30: 12, 90: 15, 180: 20 },
+  USDT: { 30: 12, 90: 15, 180: 20 },
+}
+
+function resolveApr(collateral, durationDays) {
+  const map = OFFER_APR[collateral]
+  if (!map) return null
+  return map[durationDays] ?? null
+}
+
+// ----- Controllers -----
+async function getLoans(req, res) {
+  try {
+    const userId = getUserId(req)
+    if (!userId) return jsonErr(res, 'Unauthorized', 401)
+
+    const loans = await Loan.find({ user: userId }).sort({ createdAt: -1 })
+    return jsonOk(res, loans)
+  } catch (err) {
+    console.error('[getLoans] error', err)
+    return jsonErr(res, 'Failed to fetch loans', 500)
+  }
+}
+
+async function requestLoan(req, res) {
+  try {
+    const userId = getUserId(req)
+    if (!userId) return jsonErr(res, 'Unauthorized', 401)
+
+    const { amount, duration, collateral } = req.body || {}
+    const amt = Number(amount)
+    const durationDays = Number(duration)
+    if (!amt || !durationDays || !collateral) return jsonErr(res, 'Missing fields: amount, duration, collateral')
+    if (amt <= 0) return jsonErr(res, 'Amount must be greater than 0')
+
+    const apr = resolveApr(collateral, durationDays)
+    if (apr == null) return jsonErr(res, 'Invalid offer: unsupported duration or collateral')
+
+    const startDate = new Date()
+    const dueDate = new Date(startDate)
+    dueDate.setDate(dueDate.getDate() + durationDays)
+
+    const loan = await Loan.create({
+      user: userId,
+      amount: amt,
+      apr,
+      durationDays,
+      collateral,
+      startDate,
+      dueDate,
+      balance: amt,
+      status: 'Active',
+    })
+
+    return jsonOk(res, loan, 201)
+  } catch (err) {
+    console.error('[requestLoan] error', err)
+    return jsonErr(res, 'Loan request failed', 500)
+  }
+}
+
+async function repayLoan(req, res) {
+  try {
+    const userId = getUserId(req)
+    if (!userId) return jsonErr(res, 'Unauthorized', 401)
+
+    const { loanId, amount } = req.body || {}
+    const repay = Number(amount)
+    if (!loanId || !repay) return jsonErr(res, 'Missing fields: loanId, amount')
+    if (repay <= 0) return jsonErr(res, 'Amount must be greater than 0')
+
+    const loan = await Loan.findOne({ _id: loanId, user: userId })
+    if (!loan) return jsonErr(res, 'Loan not found', 404)
+
+    const newBalance = Math.max(0, (loan.balance ?? 0) - repay)
+    loan.balance = newBalance
+    if (newBalance <= 0) loan.status = 'Repaid'
+    await loan.save()
+
+    return jsonOk(res, loan)
+  } catch (err) {
+    console.error('[repayLoan] error', err)
+    return jsonErr(res, 'Repayment failed', 500)
+  }
+}
+
+// ----- Route registration helper -----
+function registerLoanRoutes(app, options = {}) {
+  const base = (options.basePath || '/api') + '/loans'
+  app.get(base, getLoans)
+  app.post(base + '/request', requestLoan)
+  app.post(base + '/repay', repayLoan)
+}
+
+module.exports = {
+  Loan,
+  getLoans,
+  requestLoan,
+  repayLoan,
+  registerLoanRoutes,
+}
+
+/*
+Usage
+-----
+const express = require('express')
+const mongoose = require('mongoose')
+const bodyParser = require('body-parser')
+const cors = require('cors')
+const { registerLoanRoutes } = require('./path/to/be.txt')
+
+async function main() {
+  await mongoose.connect(process.env.MONGO_URL)
+  const app = express()
+  app.use(cors())
+  app.use(bodyParser.json())
+
+  // Optional auth middleware that sets req.user = { id: userId }
+  // app.use(authMiddleware)
+
+  registerLoanRoutes(app, { basePath: '/api' })
+
+  app.listen(8800, () => console.log('API on :8800'))
+}
+
+main().catch(console.error)
+*/
+

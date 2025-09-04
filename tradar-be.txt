@@ -1,0 +1,403 @@
+// Node.js Express controller and routes for Trading (demo portfolio)
+// Uses MongoDB via Mongoose. Swap the model layer as needed.
+
+// npm i express mongoose jsonwebtoken node-fetch
+const mongoose = require('mongoose')
+const jwt = require('jsonwebtoken')
+const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args))
+
+const PositionSchema = new mongoose.Schema(
+  {
+    id: { type: String, required: true },
+    assetType: { type: String, enum: ['crypto', 'stock', 'commodity', 'forex'], required: true },
+    symbol: { type: String, required: true },
+    side: { type: String, enum: ['buy', 'sell'], required: true },
+    qty: { type: Number, required: true },
+    entryPrice: { type: Number, required: true },
+    leverage: { type: Number, default: 1 },
+    sl: { type: Number },
+    tp: { type: Number },
+    status: { type: String, enum: ['open', 'closed'], default: 'open' },
+    pnl: { type: Number, default: 0 },
+  },
+  { _id: false }
+)
+
+const PortfolioSchema = new mongoose.Schema(
+  {
+    user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true, required: true, unique: true },
+    balance: { type: Number, default: 10000 },
+    positions: { type: [PositionSchema], default: [] },
+    history: { type: [PositionSchema], default: [] },
+  },
+  { timestamps: true }
+)
+
+const Portfolio = mongoose.models.TradePortfolio || mongoose.model('TradePortfolio', PortfolioSchema)
+
+// Optional Wallet model to sync trading balance with main wallet
+const WalletSchema = new mongoose.Schema(
+  {
+    user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true, required: true, unique: true },
+    balance: { type: Number, default: 0 },
+    asset: { type: String, default: 'USD' },
+    address: { type: String },
+  },
+  { timestamps: true }
+)
+
+const Wallet = mongoose.models.Wallet || mongoose.model('Wallet', WalletSchema)
+
+function jsonOk(res, data, status = 200) { return res.status(status).json({ success: true, data }) }
+function jsonErr(res, message, status = 400) { return res.status(status).json({ success: false, message }) }
+
+function getUserId(req) {
+  if (req.user && (req.user.id || req.user._id)) return req.user.id || req.user._id
+  const auth = req.headers.authorization || ''
+  if (!auth.startsWith('Bearer ')) return null
+  const token = auth.slice(7)
+  try { const d = jwt.verify(token, process.env.JWT_SECRET || 'change-me'); return d.id || d.userId || d.sub || null } catch { return null }
+}
+
+async function getOrCreatePortfolio(userId) {
+  const existing = await Portfolio.findOne({ user: userId })
+  if (existing) return existing
+  return await Portfolio.create({ user: userId, balance: 10000, positions: [], history: [] })
+}
+
+async function getOrCreateWallet(userId) {
+  const existing = await Wallet.findOne({ user: userId })
+  if (existing) return existing
+  return await Wallet.create({ user: userId, balance: 0, asset: 'USD' })
+}
+
+// GET current portfolio
+async function getPortfolio(req, res) {
+  try {
+    const userId = getUserId(req)
+    if (!userId) return jsonErr(res, 'Unauthorized', 401)
+    const pf = await getOrCreatePortfolio(userId)
+    return jsonOk(res, pf)
+  } catch (e) {
+    console.error('[getPortfolio]', e)
+    return jsonErr(res, 'Failed to load portfolio', 500)
+  }
+}
+
+// POST set portfolio (client sync)
+async function setPortfolio(req, res) {
+  try {
+    const userId = getUserId(req)
+    if (!userId) return jsonErr(res, 'Unauthorized', 401)
+    const { balance, positions, history } = req.body || {}
+    const pf = await getOrCreatePortfolio(userId)
+    pf.balance = Number(balance ?? pf.balance)
+    pf.positions = Array.isArray(positions) ? positions : pf.positions
+    pf.history = Array.isArray(history) ? history : pf.history
+    await pf.save()
+    return jsonOk(res, pf)
+  } catch (e) {
+    console.error('[setPortfolio]', e)
+    return jsonErr(res, 'Failed to save portfolio', 500)
+  }
+}
+
+// POST create order (simplified; trust client for calculations)
+async function createOrder(req, res) {
+  try {
+    const userId = getUserId(req)
+    if (!userId) return jsonErr(res, 'Unauthorized', 401)
+    const pf = await getOrCreatePortfolio(userId)
+    const pos = req.body
+    if (!pos || !pos.id) return jsonErr(res, 'Invalid order body')
+    pf.positions.unshift(pos)
+    await pf.save()
+    return jsonOk(res, pf)
+  } catch (e) {
+    console.error('[createOrder]', e)
+    return jsonErr(res, 'Failed to place order', 500)
+  }
+}
+
+// POST close position
+async function closePosition(req, res) {
+  try {
+    const userId = getUserId(req)
+    if (!userId) return jsonErr(res, 'Unauthorized', 401)
+    const { id } = req.body || {}
+    if (!id) return jsonErr(res, 'Missing id')
+    const pf = await getOrCreatePortfolio(userId)
+    const idx = pf.positions.findIndex((p) => p.id === id)
+    if (idx === -1) return jsonErr(res, 'Position not found', 404)
+    const pos = pf.positions[idx]
+    pos.status = 'closed'
+    pf.history.unshift(pos)
+    await pf.save()
+    return jsonOk(res, pf)
+  } catch (e) {
+    console.error('[closePosition]', e)
+    return jsonErr(res, 'Failed to close position', 500)
+  }
+}
+
+function registerTradeRoutes(app, options = {}) {
+  const base = (options.basePath || '/api') + '/trade'
+  app.get(base + '/portfolio', getPortfolio)
+  app.post(base + '/portfolio', setPortfolio)
+  app.post(base + '/orders', createOrder)
+  app.post(base + '/close', closePosition)
+  app.post(base + '/deposit', async (req, res) => {
+    try {
+      const userId = getUserId(req)
+      if (!userId) return jsonErr(res, 'Unauthorized', 401)
+      const { amount } = req.body || {}
+      const amt = Number(amount)
+      if (!amt || amt <= 0) return jsonErr(res, 'Invalid amount')
+      const pf = await getOrCreatePortfolio(userId)
+      const wallet = await getOrCreateWallet(userId)
+      if ((wallet.balance || 0) < amt) return jsonErr(res, 'Insufficient wallet balance')
+      wallet.balance = Number(wallet.balance || 0) - amt
+      pf.balance = Number(pf.balance || 0) + amt
+      await wallet.save()
+      await pf.save()
+      return jsonOk(res, { portfolio: pf, wallet })
+    } catch (e) {
+      console.error('[deposit]', e)
+      return jsonErr(res, 'Deposit failed', 500)
+    }
+  })
+  app.post(base + '/withdraw', async (req, res) => {
+    try {
+      const userId = getUserId(req)
+      if (!userId) return jsonErr(res, 'Unauthorized', 401)
+      const { amount } = req.body || {}
+      const amt = Number(amount)
+      if (!amt || amt <= 0) return jsonErr(res, 'Invalid amount')
+      const pf = await getOrCreatePortfolio(userId)
+      if (pf.balance < amt) return jsonErr(res, 'Insufficient trading balance')
+      const wallet = await getOrCreateWallet(userId)
+      pf.balance = Number(pf.balance || 0) - amt
+      wallet.balance = Number(wallet.balance || 0) + amt
+      await pf.save()
+      await wallet.save()
+      return jsonOk(res, { portfolio: pf, wallet })
+    } catch (e) {
+      console.error('[withdraw]', e)
+      return jsonErr(res, 'Withdrawal failed', 500)
+    }
+  })
+
+  // Wallet credit (fund main wallet)
+  app.post(base + '/wallet/credit', async (req, res) => {
+    try {
+      const userId = getUserId(req)
+      if (!userId) return jsonErr(res, 'Unauthorized', 401)
+      const { amount, asset } = req.body || {}
+      const amt = Number(amount)
+      if (!amt || amt <= 0) return jsonErr(res, 'Invalid amount')
+      const wallet = await getOrCreateWallet(userId)
+      wallet.balance = Number(wallet.balance || 0) + amt
+      if (asset) wallet.asset = asset
+      await wallet.save()
+      return jsonOk(res, wallet)
+    } catch (e) {
+      console.error('[wallet/credit]', e)
+      return jsonErr(res, 'Wallet credit failed', 500)
+    }
+  })
+
+  // Wallet debit (withdraw from main wallet)
+  app.post(base + '/wallet/debit', async (req, res) => {
+    try {
+      const userId = getUserId(req)
+      if (!userId) return jsonErr(res, 'Unauthorized', 401)
+      const { amount } = req.body || {}
+      const amt = Number(amount)
+      if (!amt || amt <= 0) return jsonErr(res, 'Invalid amount')
+      const wallet = await getOrCreateWallet(userId)
+      if ((wallet.balance || 0) < amt) return jsonErr(res, 'Insufficient wallet balance')
+      wallet.balance = Number(wallet.balance || 0) - amt
+      await wallet.save()
+      return jsonOk(res, wallet)
+    } catch (e) {
+      console.error('[wallet/debit]', e)
+      return jsonErr(res, 'Wallet debit failed', 500)
+    }
+  })
+}
+
+// ---- Price helpers ----
+const COINGECKO = 'https://api.coingecko.com/api/v3'
+async function fetchCryptoPrice(symbol) {
+  // symbol is coingecko id (e.g. bitcoin)
+  const res = await fetch(`${COINGECKO}/simple/price?ids=${symbol}&vs_currencies=usd`)
+  const j = await res.json()
+  return Number(j?.[symbol]?.usd || 0)
+}
+
+function mapCommoditySymbol(symbol){
+  if(symbol==='GOLD') return 'XAUUSD'
+  if(symbol==='SILVER') return 'XAGUSD'
+  return symbol
+}
+
+async function fetchStockOrCommodityPrice(symbol, assetType){
+  const key = process.env.ALPHA_VANTAGE_KEY || process.env.NEXT_PUBLIC_ALPHA_VANTAGE_KEY
+  const mapped = assetType==='commodity' ? mapCommoditySymbol(symbol) : symbol
+  if(!key) return 0
+  const res = await fetch(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${mapped}&apikey=${key}`)
+  const j = await res.json()
+  return Number(j?.['Global Quote']?.['05. price'] || 0)
+}
+
+async function latestPrice(assetType, symbol){
+  if(assetType==='crypto') return await fetchCryptoPrice(symbol)
+  if(assetType==='forex'){
+    const key = process.env.ALPHA_VANTAGE_KEY || process.env.NEXT_PUBLIC_ALPHA_VANTAGE_KEY
+    if(!key) return 0
+    const from = symbol.slice(0,3); const to = symbol.slice(3,6)
+    const res = await fetch(`https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency=${from}&to_currency=${to}&apikey=${key}`)
+    const j = await res.json()
+    return Number(j?.['Realtime Currency Exchange Rate']?.['5. Exchange Rate'] || 0)
+  }
+  return await fetchStockOrCommodityPrice(symbol, assetType)
+}
+
+// ---- Professional order endpoints (server-calculated margin/fees/wallet updates) ----
+async function openOrder(req, res){
+  try{
+    const userId = getUserId(req)
+    if(!userId) return jsonErr(res,'Unauthorized',401)
+    const { assetType, symbol, side, orderType='market', limitPrice, qty, leverage=1, sl, tp } = req.body || {}
+    const q = Number(qty)
+    const lev = Math.max(1, Number(leverage)||1)
+    if(!assetType || !symbol || !side || !q || q<=0) return jsonErr(res,'Invalid order payload')
+    const entry = orderType==='limit' ? Number(limitPrice) : await latestPrice(assetType, symbol)
+    if(!entry || entry<=0) return jsonErr(res,'Unable to fetch price', 502)
+    const notional = entry * q
+    const feeRate = 0.001
+    const openFee = notional * feeRate
+    const marginRequired = notional / lev
+
+    // move funds from wallet to margin (reserve)
+    const wallet = await getOrCreateWallet(userId)
+    if((wallet.balance||0) < (marginRequired + openFee)) return jsonErr(res,'Insufficient wallet balance')
+    wallet.balance = Number(wallet.balance||0) - (marginRequired + openFee)
+
+    const pf = await getOrCreatePortfolio(userId)
+    const pos = {
+      id: `${Date.now()}`,
+      assetType, symbol, side,
+      qty: q,
+      entryPrice: entry,
+      leverage: lev,
+      marginAllocated: marginRequired,
+      sl: sl? Number(sl): undefined,
+      tp: tp? Number(tp): undefined,
+      status: 'open',
+      pnl: 0,
+    }
+    pf.positions.unshift(pos)
+    await wallet.save()
+    await pf.save()
+    return jsonOk(res, { wallet, portfolio: pf, position: pos }, 201)
+  }catch(e){
+    console.error('[openOrder]', e)
+    return jsonErr(res,'Failed to open order',500)
+  }
+}
+
+async function closeOrder(req,res){
+  try{
+    const userId = getUserId(req)
+    if(!userId) return jsonErr(res,'Unauthorized',401)
+    const { id } = req.body || {}
+    if(!id) return jsonErr(res,'Missing id')
+    const pf = await getOrCreatePortfolio(userId)
+    const idx = pf.positions.findIndex(p=>p.id===id && p.status==='open')
+    if(idx===-1) return jsonErr(res,'Position not found',404)
+    const p = pf.positions[idx]
+    const price = await latestPrice(p.assetType, p.symbol)
+    if(!price) return jsonErr(res,'Unable to fetch price', 502)
+    const dir = p.side==='buy'?1:-1
+    const grossPnl = (price - p.entryPrice) * dir * p.qty * p.leverage
+    const notional = p.entryPrice * p.qty
+    const closeFee = notional * 0.001
+    const net = (p.marginAllocated||0) + grossPnl - closeFee
+    const wallet = await getOrCreateWallet(userId)
+    wallet.balance = Number(wallet.balance||0) + net
+    p.status = 'closed'
+    p.pnl = grossPnl
+    pf.history.unshift(p)
+    pf.positions.splice(idx,1)
+    await wallet.save()
+    await pf.save()
+    return jsonOk(res, { wallet, portfolio: pf, position: p })
+  }catch(e){
+    console.error('[closeOrder]', e)
+    return jsonErr(res,'Failed to close order',500)
+  }
+}
+
+async function listPositions(req,res){
+  try{
+    const userId = getUserId(req)
+    if(!userId) return jsonErr(res,'Unauthorized',401)
+    const pf = await getOrCreatePortfolio(userId)
+    return jsonOk(res, pf.positions)
+  }catch(e){
+    console.error('[listPositions]', e)
+    return jsonErr(res,'Failed',500)
+  }
+}
+
+async function listHistory(req,res){
+  try{
+    const userId = getUserId(req)
+    if(!userId) return jsonErr(res,'Unauthorized',401)
+    const pf = await getOrCreatePortfolio(userId)
+    return jsonOk(res, pf.history)
+  }catch(e){
+    console.error('[listHistory]', e)
+    return jsonErr(res,'Failed',500)
+  }
+}
+
+// Register new endpoints
+function registerTradeRoutes(app, options = {}){
+  const base = (options.basePath || '/api') + '/trade'
+  app.post(base + '/wallet/credit', async (req, res) => {
+    try { const userId = getUserId(req); if (!userId) return jsonErr(res, 'Unauthorized', 401); const { amount, asset } = req.body || {}; const amt = Number(amount); if (!amt || amt <= 0) return jsonErr(res, 'Invalid amount'); const wallet = await getOrCreateWallet(userId); wallet.balance = Number(wallet.balance || 0) + amt; if (asset) wallet.asset = asset; await wallet.save(); return jsonOk(res, wallet) } catch (e) { console.error('[wallet/credit]', e); return jsonErr(res, 'Wallet credit failed', 500) }
+  })
+  app.post(base + '/wallet/debit', async (req, res) => {
+    try { const userId = getUserId(req); if (!userId) return jsonErr(res, 'Unauthorized', 401); const { amount } = req.body || {}; const amt = Number(amount); if (!amt || amt <= 0) return jsonErr(res, 'Invalid amount'); const wallet = await getOrCreateWallet(userId); if ((wallet.balance || 0) < amt) return jsonErr(res, 'Insufficient wallet balance'); wallet.balance = Number(wallet.balance || 0) - amt; await wallet.save(); return jsonOk(res, wallet) } catch (e) { console.error('[wallet/debit]', e); return jsonErr(res, 'Wallet debit failed', 500) }
+  })
+  // Pro endpoints
+  app.post(base + '/order/open', openOrder)
+  app.post(base + '/order/close', closeOrder)
+  app.get(base + '/positions', listPositions)
+  app.get(base + '/history', listHistory)
+}
+
+module.exports = { Portfolio, Wallet, registerTradeRoutes, openOrder, closeOrder }
+
+/*
+Usage
+-----
+const express = require('express')
+const mongoose = require('mongoose')
+const bodyParser = require('body-parser')
+const cors = require('cors')
+const { registerTradeRoutes } = require('./path/to/trade-be.txt')
+
+async function main() {
+  await mongoose.connect(process.env.MONGO_URL)
+  const app = express()
+  app.use(cors())
+  app.use(bodyParser.json())
+  // app.use(authMiddleware)
+  registerTradeRoutes(app, { basePath: '/api' })
+  app.listen(8800, () => console.log('API on :8800'))
+}
+main().catch(console.error)
+*/
