@@ -1,5 +1,5 @@
 import { ethers } from "ethers";
-import { http, ws, getCurrentBlock } from "./provider.js";
+import { http, createWsProvider, getCurrentBlock } from "./provider.js";
 import Wallet from "../models/walletModel.js";
 import Tx from "../models/txModel.js";
 import Setting from "../models/settingModel.js";
@@ -76,12 +76,18 @@ async function handleEthTx(tx, currentBlock) {
 // ---- process ERC20 logs for the block
 async function handleErc20Logs(blockNumber, currentBlock) {
   for (const { address: tokenAddress, iface } of tokenContracts) {
-    const logs = await http.getLogs({
-      address: tokenAddress,
-      fromBlock: blockNumber,
-      toBlock: blockNumber,
-      topics: [TRANSFER_TOPIC], // we’ll filter 'to' in code for many addresses
-    });
+    let logs = [];
+    try {
+      logs = await http.getLogs({
+        address: tokenAddress,
+        fromBlock: blockNumber,
+        toBlock: blockNumber,
+        topics: [TRANSFER_TOPIC], // we’ll filter 'to' in code for many addresses
+      });
+    } catch (e) {
+      console.error("getLogs error:", e?.message || e);
+      continue;
+    }
 
     for (const log of logs) {
       const parsed = iface.parseLog(log);
@@ -124,8 +130,21 @@ async function handleErc20Logs(blockNumber, currentBlock) {
 
 // ---- process a single block (ETH txs + ERC20 logs)
 async function processBlock(blockNumber) {
-  const currentBlock = await http.getBlockNumber();
-  const block = await http.getBlock(blockNumber, true); // include txs
+  let currentBlock;
+  try {
+    currentBlock = await http.getBlockNumber();
+  } catch (e) {
+    console.error("getBlockNumber error:", e?.message || e);
+    return; // bail out gracefully
+  }
+
+  let block;
+  try {
+    block = await http.getBlock(blockNumber, true); // include txs
+  } catch (e) {
+    console.error("getBlock error:", e?.message || e);
+    return;
+  }
 
   // ETH transfers directly into user wallets
   for (const tx of block.transactions) {
@@ -142,27 +161,77 @@ async function processBlock(blockNumber) {
 
 // ---- catch-up on startup + live follow
 export async function startDepositIndexer() {
-  // catch up from last cursor
-  const tip = await getCurrentBlock();
-  const cursor = (await getCursor()) ?? tip;
+  try {
+    // helper: catch-up attempts with retry on failure
+    const attemptCatchUp = async () => {
+      const tip = await getCurrentBlock();
+      if (tip == null) return false;
 
-  // If we missed blocks, catch up sequentially
-  for (let b = cursor; b <= tip; b++) {
-    await processBlock(b);
-  }
+      const cursor = (await getCursor()) ?? tip;
+      for (let b = cursor; b <= tip; b++) {
+        try {
+          await processBlock(b);
+        } catch (e) {
+          console.error("Caught-up block processing error:", e?.message || e);
+        }
+      }
+      return true;
+    };
 
-  // then follow new blocks in realtime
-  ws.on("block", async (bNumber) => {
-    try {
-      await processBlock(bNumber);
-    } catch (e) {
-      console.error("Block processing error:", e);
+    // initial catch-up (non-fatal on failure)
+    const ok = await attemptCatchUp();
+    if (!ok) {
+      console.error("Catch-up failed; will retry in 15s.");
+      setTimeout(async () => {
+        try { await attemptCatchUp(); } catch (_) {}
+      }, 15000);
     }
-  });
 
-  ws._websocket?.on("close", () => {
-    console.error("WS closed. Consider reconnect logic.");
-  });
+    // realtime follow with auto-reconnect
+    let ws = createWsProvider();
+    let reconnectAttempts = 0;
 
-  console.log(`📡 Deposit indexer running. Watching ${allAddresses().size} wallet(s).`);
+    const attach = () => {
+      ws.on("block", async (bNumber) => {
+        try {
+          await processBlock(bNumber);
+        } catch (e) {
+          console.error("Block processing error:", e?.message || e);
+        }
+      });
+
+      // reset backoff when connection is open (best-effort)
+      ws._websocket?.on?.("open", () => { reconnectAttempts = 0; });
+
+      ws._websocket?.on?.("close", () => {
+        console.error("WS closed. Reconnecting with backoff...");
+        scheduleReconnect();
+      });
+
+      ws.on?.("error", (err) => {
+        console.error("WS provider error (indexer):", err?.message || err);
+      });
+    };
+
+    const scheduleReconnect = () => {
+      reconnectAttempts += 1;
+      const delay = Math.min(30000, 1000 * 2 ** Math.min(reconnectAttempts, 5));
+      setTimeout(() => {
+        try {
+          ws = createWsProvider();
+          attach();
+        } catch (e) {
+          console.error("Reconnect failed:", e?.message || e);
+          scheduleReconnect();
+        }
+      }, delay);
+    };
+
+    attach();
+
+    console.log(`📡 Deposit indexer running. Watching ${allAddresses().size} wallet(s).`);
+  } catch (e) {
+    // ensure we never throw out of this function; only log
+    console.error("startDepositIndexer failed:", e?.message || e);
+  }
 }
