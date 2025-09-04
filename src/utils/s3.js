@@ -1,7 +1,7 @@
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
-const S3_BUCKET = process.env.S3_BUCKET;
+const S3_BUCKET = process.env.S3_BUCKET || process.env.AWS_S3_BUCKET;
 const S3_REGION = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION;
 const S3_PUBLIC_BASE = process.env.S3_PUBLIC_BASE; // optional CDN/base URL
 
@@ -30,10 +30,19 @@ export async function s3PresignedGetUrl(key, expiresIn = 3600) {
   return await getSignedUrl(s3Client, getCmd, { expiresIn });
 }
 
+// Generate a presigned URL for PUT (upload)
+export async function presignPutUrl({ Bucket, Key, ContentType, expiresIn = 900 }) {
+  if (!isS3Enabled()) throw new Error("S3 not configured");
+  const bucket = Bucket || S3_BUCKET;
+  if (!bucket) throw new Error("Bucket not provided");
+  if (!Key) throw new Error("Key is required");
+  const putCmd = new PutObjectCommand({ Bucket: bucket, Key, ContentType: ContentType });
+  return await getSignedUrl(s3Client, putCmd, { expiresIn });
+}
+
 export function s3PublicUrl(key) {
   if (S3_PUBLIC_BASE) {
     return `${S3_PUBLIC_BASE.replace(/\/$/, "")}/${key}`;
   }
   return null;
 }
-
