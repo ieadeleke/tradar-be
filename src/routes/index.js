@@ -7,6 +7,8 @@ import tradeRoutes from "./tradeRoutes.js";
 import transactionRoutes from "./transactionRoutes.js";
 import loanRoutes from "./loanRoutes.js";
 import tradePortfolioRoutes from "./tradePortfolioRoutes.js";
+import fundingRoutes from "./fundingRoutes.js";
+import webhookRoutes from "./webhookRoutes.js";
 
 const router = express.Router();
 
@@ -18,5 +20,7 @@ router.use("/trades", tradeRoutes);
 router.use("/transactions", transactionRoutes);
 router.use("/loans", loanRoutes);
 router.use("/trade", tradePortfolioRoutes);
+router.use("/funding", fundingRoutes);
+router.use("/webhooks", webhookRoutes);
 
 export default router;

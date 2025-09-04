@@ -1,179 +1,278 @@
-// Node.js Express controller and routes for Loans
-// Uses MongoDB via Mongoose. Swap out the model layer if needed.
+// Express/Mongoose funding routes for Bank/Crypto/PayPal deposits
+// Copy into your existing Express backend. Assumes JWT auth and wallet helpers
+// from your current trading backend (see trade-be.txt patterns).
 
-// npm i express mongoose jsonwebtoken
+// npm i express mongoose jsonwebtoken node-fetch
 const mongoose = require('mongoose')
 const jwt = require('jsonwebtoken')
 
-// ----- Model (keep here for portability) -----
-const LoanSchema = new mongoose.Schema(
-  {
-    user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true, required: true },
-    amount: { type: Number, required: true },
-    apr: { type: Number, required: true }, // Annual percentage rate
-    durationDays: { type: Number, required: true },
-    collateral: { type: String, required: true },
-    startDate: { type: Date, required: true },
-    dueDate: { type: Date, required: true },
-    balance: { type: Number, required: true },
-    status: { type: String, enum: ['Active', 'Repaid', 'Overdue'], default: 'Active' },
+// --- Models ---
+const FundingSchema = new mongoose.Schema({
+  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true, required: true },
+  method: { type: String, enum: ['bank','crypto','paypal','card'], required: true },
+  amount: { type: Number, required: true },
+  asset: { type: String, default: 'USD' },
+  network: { type: String },
+  status: { type: String, enum: ['pending','approved','rejected'], default: 'pending' },
+  meta: { type: mongoose.Schema.Types.Mixed },
+  proof: {
+    url: String,
+    filename: String,
+    mimetype: String,
+    size: Number,
+    path: String,
   },
-  { timestamps: true }
-)
+}, { timestamps: true })
 
-// Prevent model overwrite in dev hot-reload
-const Loan = mongoose.models.Loan || mongoose.model('Loan', LoanSchema)
+const WalletSchema = new mongoose.Schema({
+  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true, unique: true, required: true },
+  balance: { type: Number, default: 0 },
+  asset: { type: String, default: 'USD' },
+  address: { type: String },
+}, { timestamps: true })
 
-// ----- Helpers -----
-function jsonOk(res, data, status = 200) {
-  return res.status(status).json({ success: true, data })
-}
+const Funding = mongoose.models.Funding || mongoose.model('Funding', FundingSchema)
+const Wallet = mongoose.models.Wallet || mongoose.model('Wallet', WalletSchema)
 
-function jsonErr(res, message, status = 400) {
-  return res.status(status).json({ success: false, message })
-}
-
-function getUserId(req) {
+// --- Helpers ---
+function jsonOk(res, data, status=200){ return res.status(status).json({ success: true, data }) }
+function jsonErr(res, message, status=400){ return res.status(status).json({ success: false, message }) }
+function getUserId(req){
   if (req.user && (req.user.id || req.user._id)) return req.user.id || req.user._id
   const auth = req.headers.authorization || ''
   if (!auth.startsWith('Bearer ')) return null
   const token = auth.slice(7)
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'change-me')
-    return decoded.id || decoded.userId || decoded.sub || null
-  } catch (e) {
-    return null
+  try { const d = jwt.verify(token, process.env.JWT_SECRET || 'change-me'); return d.id || d.userId || d.sub || null } catch { return null }
+}
+
+async function getOrCreateWallet(userId){
+  const existing = await Wallet.findOne({ user: userId })
+  if (existing) return existing
+  return await Wallet.create({ user: userId, balance: 0, asset: 'USD' })
+}
+
+// Map (asset, network) -> deposit address from env
+function resolveCryptoAddress(asset, network){
+  // Normalize keys like USDT_TRON, BTC_BITCOIN, ETH_ETHEREUM
+  const key = `${String(asset||'').toUpperCase()}_${String(network||'').toUpperCase()}`
+  const envKey = `CRYPTO_ADDR_${key}` // e.g. CRYPTO_ADDR_USDT_TRON
+  return process.env[envKey] || ''
+}
+
+// Bank details from env
+function getBankDetails(){
+  return {
+    bankName: process.env.BANK_NAME || '',
+    accountName: process.env.BANK_ACCOUNT_NAME || '',
+    accountNumber: process.env.BANK_ACCOUNT_NUMBER || '',
+    iban: process.env.BANK_IBAN || '',
+    swift: process.env.BANK_SWIFT || '',
+    currency: process.env.BANK_CURRENCY || 'USD',
   }
 }
 
-// Map of valid offers -> APR by duration
-const OFFER_APR = {
-  BTC: { 30: 12, 90: 15, 180: 20 },
-  ETH: { 30: 12, 90: 15, 180: 20 },
-  USDT: { 30: 12, 90: 15, 180: 20 },
+// --- Routes ---
+function registerFundingRoutes(app, opts = {}){
+  const base = (opts.basePath || '/api') + '/funding'
+
+  // Public (or auth) endpoints for client
+  app.get(base + '/bank-details', async (req, res) => {
+    return jsonOk(res, getBankDetails())
+  })
+
+  app.get(base + '/crypto-address', async (req, res) => {
+    const { asset, network } = req.query || {}
+    if (!asset || !network) return jsonErr(res, 'asset and network are required', 400)
+    const address = resolveCryptoAddress(asset, network)
+    if (!address) return jsonErr(res, 'No deposit address configured for this asset/network', 404)
+    return jsonOk(res, { address, asset, network })
+  })
+
+  // Create a funding request for non-card methods
+  app.post(base + '/request', async (req, res) => {
+    try {
+      const userId = getUserId(req)
+      if (!userId) return jsonErr(res, 'Unauthorized', 401)
+      const { method, amount, asset, network, meta } = req.body || {}
+      const amt = Number(amount)
+      if (!method || !amt || amt <= 0) return jsonErr(res, 'Invalid method or amount')
+      if (!['bank','crypto','paypal'].includes(method)) return jsonErr(res, 'Unsupported method')
+      const fr = await Funding.create({ user: userId, method, amount: amt, asset: asset || 'USD', network, status: 'pending', meta })
+      return jsonOk(res, fr, 201)
+    } catch (e){
+      console.error('[funding/request]', e)
+      return jsonErr(res, 'Failed to create funding request', 500)
+    }
+  })
+
+  // User: list my funding requests
+  app.get(base + '/my-requests', async (req, res) => {
+    try {
+      const userId = getUserId(req)
+      if (!userId) return jsonErr(res, 'Unauthorized', 401)
+      const list = await Funding.find({ user: userId }).sort({ createdAt: -1 })
+      return jsonOk(res, list)
+    } catch (e){
+      console.error('[funding/my-requests]', e)
+      return jsonErr(res, 'Failed to list requests', 500)
+    }
+  })
+
+  // Admin: list funding requests
+  app.get(base + '/requests', async (req, res) => {
+    try {
+      // TODO: add admin auth check
+      const q = {}
+      if (req.query.status) q.status = req.query.status
+      const list = await Funding.find(q).sort({ createdAt: -1 }).limit(200)
+      return jsonOk(res, list)
+    } catch (e){
+      console.error('[funding/requests]', e)
+      return jsonErr(res, 'Failed to list funding requests', 500)
+    }
+  })
+
+  // Admin: approve funding request and credit wallet
+  app.post(base + '/:id/approve', async (req, res) => {
+    try {
+      // TODO: add admin auth check
+      const { id } = req.params
+      const fr = await Funding.findById(id)
+      if (!fr) return jsonErr(res, 'Not found', 404)
+      if (fr.status !== 'pending') return jsonErr(res, 'Already processed')
+
+      const wallet = await getOrCreateWallet(fr.user)
+      wallet.balance = Number(wallet.balance || 0) + Number(fr.amount)
+      if (fr.asset) wallet.asset = fr.asset
+      await wallet.save()
+      fr.status = 'approved'
+      await fr.save()
+      return jsonOk(res, { funding: fr, wallet })
+    } catch (e){
+      console.error('[funding/approve]', e)
+      return jsonErr(res, 'Approval failed', 500)
+    }
+  })
+
+  // Admin: reject
+  app.post(base + '/:id/reject', async (req, res) => {
+    try {
+      // TODO: add admin auth check
+      const { id } = req.params
+      const fr = await Funding.findById(id)
+      if (!fr) return jsonErr(res, 'Not found', 404)
+      if (fr.status !== 'pending') return jsonErr(res, 'Already processed')
+      fr.status = 'rejected'
+      fr.meta = { ...(fr.meta || {}), rejectReason: req.body?.reason || '' }
+      await fr.save()
+      return jsonOk(res, fr)
+    } catch (e){
+      console.error('[funding/reject]', e)
+      return jsonErr(res, 'Rejection failed', 500)
+    }
+  })
+
+  // Upload payment proof for a funding request (bank transfers)
+  const multer = require('multer')
+  const path = require('path')
+  const fs = require('fs')
+  const uploadDir = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads')
+  if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true })
+  const storage = multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, uploadDir),
+    filename: (_req, file, cb) => {
+      const unique = Date.now() + '-' + Math.round(Math.random()*1e9)
+      cb(null, unique + '-' + file.originalname.replace(/\s+/g,'_'))
+    }
+  })
+  const upload = multer({ storage, limits: { fileSize: 10*1024*1024 } })
+
+  app.post(base + '/:id/proof', upload.single('file'), async (req, res) => {
+    try {
+      const userId = getUserId(req)
+      if (!userId) return jsonErr(res, 'Unauthorized', 401)
+      const { id } = req.params
+      const fr = await Funding.findById(id)
+      if (!fr) return jsonErr(res, 'Not found', 404)
+      if (String(fr.user) !== String(userId)) return jsonErr(res, 'Forbidden', 403)
+      if (!req.file) return jsonErr(res, 'Missing file', 400)
+      const urlBase = process.env.UPLOADS_PUBLIC_BASE || ''
+      fr.proof = {
+        url: urlBase ? `${urlBase}/${path.basename(req.file.path)}` : undefined,
+        filename: req.file.filename,
+        mimetype: req.file.mimetype,
+        size: req.file.size,
+        path: req.file.path,
+      }
+      fr.markModified('proof')
+      await fr.save()
+      return jsonOk(res, fr)
+    } catch (e){
+      console.error('[funding/proof]', e)
+      return jsonErr(res, 'Upload failed', 500)
+    }
+  })
+
+  // PayPal webhook
+  const express = require('express')
+  app.post((opts.basePath || '/api') + '/webhooks/paypal', express.json({ type: '*/*' }), async (req, res) => {
+    try {
+      // TODO: Verify webhook signature via PayPal SDK/API
+      const event = req.body || {}
+      const eventType = event?.event_type || event?.eventType
+      const pu = event?.resource?.purchase_units?.[0]
+      const customId = pu?.custom_id || event?.resource?.custom_id
+      const amount = Number(pu?.amount?.value || event?.resource?.amount?.value)
+      if (eventType === 'PAYMENT.CAPTURE.COMPLETED' || eventType === 'CHECKOUT.ORDER.APPROVED') {
+        if (customId) {
+          const fr = await Funding.findById(customId)
+          if (fr && fr.status === 'pending') {
+            const wallet = await getOrCreateWallet(fr.user)
+            wallet.balance = Number(wallet.balance || 0) + (amount || fr.amount)
+            if (fr.asset) wallet.asset = fr.asset
+            await wallet.save()
+            fr.status = 'approved'
+            fr.meta = { ...(fr.meta || {}), paypal: { id: event?.id, resource: event?.resource } }
+            await fr.save()
+          }
+        }
+      }
+      return res.sendStatus(200)
+    } catch (e){
+      console.error('[webhooks/paypal]', e)
+      return res.sendStatus(500)
+    }
+  })
 }
 
-function resolveApr(collateral, durationDays) {
-  const map = OFFER_APR[collateral]
-  if (!map) return null
-  return map[durationDays] ?? null
-}
-
-// ----- Controllers -----
-async function getLoans(req, res) {
-  try {
-    const userId = getUserId(req)
-    if (!userId) return jsonErr(res, 'Unauthorized', 401)
-
-    const loans = await Loan.find({ user: userId }).sort({ createdAt: -1 })
-    return jsonOk(res, loans)
-  } catch (err) {
-    console.error('[getLoans] error', err)
-    return jsonErr(res, 'Failed to fetch loans', 500)
-  }
-}
-
-async function requestLoan(req, res) {
-  try {
-    const userId = getUserId(req)
-    if (!userId) return jsonErr(res, 'Unauthorized', 401)
-
-    const { amount, duration, collateral } = req.body || {}
-    const amt = Number(amount)
-    const durationDays = Number(duration)
-    if (!amt || !durationDays || !collateral) return jsonErr(res, 'Missing fields: amount, duration, collateral')
-    if (amt <= 0) return jsonErr(res, 'Amount must be greater than 0')
-
-    const apr = resolveApr(collateral, durationDays)
-    if (apr == null) return jsonErr(res, 'Invalid offer: unsupported duration or collateral')
-
-    const startDate = new Date()
-    const dueDate = new Date(startDate)
-    dueDate.setDate(dueDate.getDate() + durationDays)
-
-    const loan = await Loan.create({
-      user: userId,
-      amount: amt,
-      apr,
-      durationDays,
-      collateral,
-      startDate,
-      dueDate,
-      balance: amt,
-      status: 'Active',
-    })
-
-    return jsonOk(res, loan, 201)
-  } catch (err) {
-    console.error('[requestLoan] error', err)
-    return jsonErr(res, 'Loan request failed', 500)
-  }
-}
-
-async function repayLoan(req, res) {
-  try {
-    const userId = getUserId(req)
-    if (!userId) return jsonErr(res, 'Unauthorized', 401)
-
-    const { loanId, amount } = req.body || {}
-    const repay = Number(amount)
-    if (!loanId || !repay) return jsonErr(res, 'Missing fields: loanId, amount')
-    if (repay <= 0) return jsonErr(res, 'Amount must be greater than 0')
-
-    const loan = await Loan.findOne({ _id: loanId, user: userId })
-    if (!loan) return jsonErr(res, 'Loan not found', 404)
-
-    const newBalance = Math.max(0, (loan.balance ?? 0) - repay)
-    loan.balance = newBalance
-    if (newBalance <= 0) loan.status = 'Repaid'
-    await loan.save()
-
-    return jsonOk(res, loan)
-  } catch (err) {
-    console.error('[repayLoan] error', err)
-    return jsonErr(res, 'Repayment failed', 500)
-  }
-}
-
-// ----- Route registration helper -----
-function registerLoanRoutes(app, options = {}) {
-  const base = (options.basePath || '/api') + '/loans'
-  app.get(base, getLoans)
-  app.post(base + '/request', requestLoan)
-  app.post(base + '/repay', repayLoan)
-}
-
-module.exports = {
-  Loan,
-  getLoans,
-  requestLoan,
-  repayLoan,
-  registerLoanRoutes,
-}
+module.exports = { registerFundingRoutes }
 
 /*
-Usage
------
+Usage:
+
 const express = require('express')
 const mongoose = require('mongoose')
-const bodyParser = require('body-parser')
-const cors = require('cors')
-const { registerLoanRoutes } = require('./path/to/be.txt')
+const { registerFundingRoutes } = require('./backend-funding') // adjust path
 
-async function main() {
-  await mongoose.connect(process.env.MONGO_URL)
-  const app = express()
-  app.use(cors())
-  app.use(bodyParser.json())
+const app = express()
+app.use(express.json())
+// attach auth middleware that sets req.user from JWT (as in your backend)
 
-  // Optional auth middleware that sets req.user = { id: userId }
-  // app.use(authMiddleware)
+registerFundingRoutes(app, { basePath: '/api' })
 
-  registerLoanRoutes(app, { basePath: '/api' })
+// ENV VARS to configure
+// BANK_NAME, BANK_ACCOUNT_NAME, BANK_ACCOUNT_NUMBER, BANK_IBAN, BANK_SWIFT, BANK_CURRENCY
+// CRYPTO_ADDR_USDT_TRON, CRYPTO_ADDR_USDT_BSC, CRYPTO_ADDR_BTC_BITCOIN, CRYPTO_ADDR_ETH_ETHEREUM, ...
+// UPLOAD_DIR (default ./uploads), UPLOADS_PUBLIC_BASE (if serving files via CDN)
+// Also expose uploads: app.use('/uploads', express.static(process.env.UPLOAD_DIR || path.join(process.cwd(),'uploads')))
 
-  app.listen(8800, () => console.log('API on :8800'))
-}
-
-main().catch(console.error)
+// Frontend calls:
+// GET /api/funding/bank-details
+// GET /api/funding/crypto-address?asset=USDT&network=TRON
+// POST /api/funding/request { method: 'bank'|'crypto'|'paypal', amount, asset?, network?, meta }
+// GET /api/funding/my-requests -> for the Transaction History page
+// Admin approves: POST /api/funding/:id/approve -> credits wallet
+// Admin rejects: POST /api/funding/:id/reject { reason }
+// Upload proof: POST /api/funding/:id/proof (multipart/form-data, field name: file)
+// PayPal webhook: POST /api/webhooks/paypal (configure on PayPal)
 */
-

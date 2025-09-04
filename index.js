@@ -6,9 +6,19 @@ import routes from "./src/routes/index.js";
 import { ok } from "./src/utils/response.js";
 import { notFound, errorHandler } from "./src/middlewares/errorHandler.js";
 import connectDB from "./src/config/db.js";
+import path from "path";
+import fs from "fs";
 
 // Load environment variables
 dotenv.config();
+
+// Guard against unexpected unhandled errors bringing down the process
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled Rejection:", reason?.message || reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught Exception:", err?.message || err);
+});
 
 const app = express();
 const PORT = process.env.PORT || 8800;
@@ -17,6 +27,13 @@ const PORT = process.env.PORT || 8800;
 app.use(express.json());
 app.use(cors());
 app.use(morgan("dev"));
+
+// Static uploads (optional)
+const uploadDir = process.env.UPLOAD_DIR || path.join(process.cwd(), "uploads");
+try {
+  if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+  app.use("/uploads", express.static(uploadDir));
+} catch (_) {}
 
 connectDB();
 // API routes

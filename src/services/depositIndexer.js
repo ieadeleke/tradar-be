@@ -1,5 +1,5 @@
 import { ethers } from "ethers";
-import { http, createWsProvider, getCurrentBlock } from "./provider.js";
+import { http, createWsProvider, getCurrentBlock, getLogsSafe, getBlockSafe } from "./provider.js";
 import Wallet from "../models/walletModel.js";
 import Tx from "../models/txModel.js";
 import Setting from "../models/settingModel.js";
@@ -14,6 +14,30 @@ const TOKEN_ADDRS = (process.env.ERC20_TRACKED || "")
 
 const tokenContracts = TOKEN_ADDRS.map(a => ({ address: a, iface: new ethers.Interface(ERC20_ABI) }));
 const TRANSFER_TOPIC = new ethers.Interface(ERC20_ABI).getEvent("Transfer").topicHash;
+const TOKEN_SCAN_DELAY_MS = Number(process.env.TOKEN_SCAN_DELAY_MS || 150);
+const TOKEN_SCAN_JITTER_MS = Number(process.env.TOKEN_SCAN_JITTER_MS || 120);
+
+const tokenMetaCache = new Map();
+async function getTokenMeta(tokenAddress) {
+  const key = tokenAddress.toLowerCase();
+  if (tokenMetaCache.has(key)) return tokenMetaCache.get(key);
+  try {
+    const c = new ethers.Contract(tokenAddress, ERC20_ABI, http);
+    const [decimals, symbol] = await Promise.all([
+      c.decimals().catch(() => 18),
+      c.symbol().catch(() => "ERC20"),
+    ]);
+    const meta = { decimals: Number(decimals), symbol };
+    tokenMetaCache.set(key, meta);
+    return meta;
+  } catch (_) {
+    const meta = { decimals: 18, symbol: "ERC20" };
+    tokenMetaCache.set(key, meta);
+    return meta;
+  }
+}
+
+function wait(ms) { return new Promise(res => setTimeout(res, ms)); }
 
 // ---- helpers
 async function getCursor() {
@@ -76,14 +100,21 @@ async function handleEthTx(tx, currentBlock) {
 // ---- process ERC20 logs for the block
 async function handleErc20Logs(blockNumber, currentBlock) {
   for (const { address: tokenAddress, iface } of tokenContracts) {
+    let meta = { decimals: 18, symbol: "ERC20" };
+    try { meta = await getTokenMeta(tokenAddress); } catch (_) {}
     let logs = [];
     try {
-      logs = await http.getLogs({
+      // small jitter to avoid synchronized bursts across tokens
+      if (TOKEN_SCAN_JITTER_MS > 0) {
+        const jitter = Math.floor(Math.random() * TOKEN_SCAN_JITTER_MS);
+        await wait(jitter);
+      }
+      logs = await getLogsSafe({
         address: tokenAddress,
         fromBlock: blockNumber,
         toBlock: blockNumber,
         topics: [TRANSFER_TOPIC], // we’ll filter 'to' in code for many addresses
-      });
+      }, { retries: 4, baseDelayMs: 500 });
     } catch (e) {
       console.error("getLogs error:", e?.message || e);
       continue;
@@ -102,8 +133,7 @@ async function handleErc20Logs(blockNumber, currentBlock) {
 
       const confirmations = currentBlock - (log.blockNumber || 0) + 1;
       const status = confirmations >= CONFIRMATIONS ? "confirmed" : "pending";
-
-      const amountEthUnits = toDec(value); // WARNING: assumes 18 decimals; for USDT/USDC adjust using decimals()
+      const amountEthUnits = ethers.formatUnits(value, meta.decimals);
 
       const doc = await Tx.findOneAndUpdate(
         { txHash: log.transactionHash.toLowerCase(), logIndex: log.logIndex },
@@ -113,7 +143,7 @@ async function handleErc20Logs(blockNumber, currentBlock) {
             wallet: wallet._id,
             direction: "deposit",
             chain: "ethereum",
-            assetSymbol: "ERC20",       // you can resolve actual symbol with a cache
+            assetSymbol: meta.symbol,
             assetAddress: tokenAddress,
             amount: amountEthUnits,
             blockNumber: log.blockNumber,
@@ -125,6 +155,7 @@ async function handleErc20Logs(blockNumber, currentBlock) {
 
       if (doc.status === "confirmed") await creditIfConfirmed(doc);
     }
+    if (TOKEN_SCAN_DELAY_MS > 0) { await wait(TOKEN_SCAN_DELAY_MS); }
   }
 }
 
@@ -140,7 +171,7 @@ async function processBlock(blockNumber) {
 
   let block;
   try {
-    block = await http.getBlock(blockNumber, true); // include txs
+    block = await getBlockSafe(blockNumber, true);
   } catch (e) {
     console.error("getBlock error:", e?.message || e);
     return;
