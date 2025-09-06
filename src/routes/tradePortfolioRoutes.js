@@ -13,6 +13,12 @@ import {
   withdrawFromTrading,
   walletCredit,
   walletDebit,
+  // Autotrade
+  getAutoTrade,
+  setAutoTrade,
+  startAutoTrade,
+  stopAutoTrade,
+  autoTradeStatus,
 } from "../controllers/tradePortfolioController.js";
 
 const router = express.Router();
@@ -34,5 +40,11 @@ router.post("/withdraw", protect, withdrawFromTrading);
 router.post("/wallet/credit", protect, walletCredit);
 router.post("/wallet/debit", protect, walletDebit);
 
-export default router;
+// Autotrade
+router.get("/autotrade", protect, getAutoTrade);
+router.post("/autotrade", protect, setAutoTrade);
+router.get("/autotrade/status", protect, autoTradeStatus);
+router.post("/autotrade/start", protect, startAutoTrade);
+router.post("/autotrade/stop", protect, stopAutoTrade);
 
+export default router;

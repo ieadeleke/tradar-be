@@ -1,5 +1,6 @@
 import TradePortfolio from "../models/tradePortfolioModel.js";
 import Wallet from "../models/walletModel.js";
+import AutoTradeConfig from "../models/autoTradeModel.js";
 import { ok, created, fail } from "../utils/response.js";
 import fetch from "node-fetch";
 
@@ -88,7 +89,7 @@ async function fetchStockOrCommodityPrice(symbol, assetType) {
   const j = await res.json();
   return Number(j?.["Global Quote"]?.["05. price"] || 0);
 }
-async function latestPrice(assetType, symbol) {
+export async function latestPrice(assetType, symbol) {
   if (assetType === "crypto") return await fetchCryptoPrice(symbol);
   if (assetType === "forex") {
     const key = process.env.ALPHA_VANTAGE_KEY || process.env.NEXT_PUBLIC_ALPHA_VANTAGE_KEY;
@@ -102,42 +103,48 @@ async function latestPrice(assetType, symbol) {
   return await fetchStockOrCommodityPrice(symbol, assetType);
 }
 
+// Core order open helper that can be reused from endpoints and autotrader
+export async function openOrderForUser(userId, { assetType, symbol, side, orderType = "market", limitPrice, qty, leverage = 1, sl, tp }) {
+  const q = Number(qty);
+  const lev = Math.max(1, Number(leverage) || 1);
+  if (!assetType || !symbol || !side || !q || q <= 0) throw new Error("Invalid order payload");
+  const entry = orderType === "limit" ? Number(limitPrice) : await latestPrice(assetType, symbol);
+  if (!entry || entry <= 0) throw new Error("Unable to fetch price");
+  const notional = entry * q;
+  const feeRate = 0.001;
+  const openFee = notional * feeRate;
+  const marginRequired = notional / lev;
+
+  const wallet = await getOrCreateWallet(userId);
+  if (!wallet || (wallet.balance || 0) < marginRequired + openFee) throw new Error("Insufficient wallet balance");
+  wallet.balance = Number(wallet.balance || 0) - (marginRequired + openFee);
+
+  const pf = await getOrCreatePortfolio(userId);
+  const pos = {
+    id: `${Date.now()}`,
+    assetType,
+    symbol,
+    side,
+    qty: q,
+    entryPrice: entry,
+    leverage: lev,
+    marginAllocated: marginRequired,
+    sl: sl ? Number(sl) : undefined,
+    tp: tp ? Number(tp) : undefined,
+    status: "open",
+    pnl: 0,
+  };
+  pf.positions.unshift(pos);
+  await wallet.save();
+  await pf.save();
+  return { wallet, portfolio: pf, position: pos };
+}
+
 export const openOrder = async (req, res) => {
   try {
     const { assetType, symbol, side, orderType = "market", limitPrice, qty, leverage = 1, sl, tp } = req.body || {};
-    const q = Number(qty);
-    const lev = Math.max(1, Number(leverage) || 1);
-    if (!assetType || !symbol || !side || !q || q <= 0) return fail(res, { statusCode: 400, message: "Invalid order payload", error: "Validation" });
-    const entry = orderType === "limit" ? Number(limitPrice) : await latestPrice(assetType, symbol);
-    if (!entry || entry <= 0) return fail(res, { statusCode: 502, message: "Unable to fetch price", error: "Pricing" });
-    const notional = entry * q;
-    const feeRate = 0.001;
-    const openFee = notional * feeRate;
-    const marginRequired = notional / lev;
-
-    const wallet = await getOrCreateWallet(req.user.id);
-    if (!wallet || (wallet.balance || 0) < marginRequired + openFee) return fail(res, { statusCode: 400, message: "Insufficient wallet balance", error: "Funds" });
-    wallet.balance = Number(wallet.balance || 0) - (marginRequired + openFee);
-
-    const pf = await getOrCreatePortfolio(req.user.id);
-    const pos = {
-      id: `${Date.now()}`,
-      assetType,
-      symbol,
-      side,
-      qty: q,
-      entryPrice: entry,
-      leverage: lev,
-      marginAllocated: marginRequired,
-      sl: sl ? Number(sl) : undefined,
-      tp: tp ? Number(tp) : undefined,
-      status: "open",
-      pnl: 0,
-    };
-    pf.positions.unshift(pos);
-    await wallet.save();
-    await pf.save();
-    created(res, { wallet, portfolio: pf, position: pos }, "Order opened");
+    const result = await openOrderForUser(req.user.id, { assetType, symbol, side, orderType, limitPrice, qty, leverage, sl, tp });
+    created(res, result, "Order opened");
   } catch (e) {
     fail(res, { statusCode: 500, message: "Failed to open order", error: e });
   }
@@ -188,6 +195,78 @@ export const listHistory = async (req, res) => {
     ok(res, pf.history, "Position history");
   } catch (e) {
     fail(res, { statusCode: 500, message: "Failed", error: e });
+  }
+};
+
+// --- Autotrade (Mongo-backed scheduling) ---
+
+export const getAutoTrade = async (req, res) => {
+  try {
+    const cfg = await AutoTradeConfig.findOne({ user: req.user.id });
+    ok(res, cfg || {}, "Autotrade settings");
+  } catch (e) {
+    fail(res, { statusCode: 500, message: "Failed to load autotrade", error: e });
+  }
+};
+
+export const setAutoTrade = async (req, res) => {
+  try {
+    const payload = req.body || {};
+    const existing = await AutoTradeConfig.findOne({ user: req.user.id });
+    let cfg;
+    if (existing) {
+      Object.assign(existing, payload);
+      cfg = await existing.save();
+    } else {
+      cfg = await AutoTradeConfig.create({ user: req.user.id, ...payload });
+    }
+    ok(res, cfg, "Autotrade saved");
+  } catch (e) {
+    fail(res, { statusCode: 500, message: "Failed to save autotrade", error: e });
+  }
+};
+
+export const autoTradeStatus = async (req, res) => {
+  try {
+    const cfg = await AutoTradeConfig.findOne({ user: req.user.id });
+    const nextRunInSec = cfg?.nextRunAt ? Math.max(0, Math.round((cfg.nextRunAt.getTime() - Date.now())/1000)) : null;
+    const paused = !!(cfg?.pausedUntil && cfg.pausedUntil > new Date());
+    ok(res, {
+      running: !!cfg?.enabled,
+      processing: !!(cfg?.lockedUntil && cfg.lockedUntil > new Date()),
+      paused,
+      resumeAt: paused ? cfg?.pausedUntil : null,
+      nextRunInSec,
+      config: cfg || null,
+    }, "Autotrade status");
+  } catch (e) {
+    fail(res, { statusCode: 500, message: "Failed to get status", error: e });
+  }
+};
+
+export const startAutoTrade = async (req, res) => {
+  try {
+    const payload = req.body || {};
+    let cfg = await AutoTradeConfig.findOne({ user: req.user.id });
+    if (!cfg) cfg = await AutoTradeConfig.create({ user: req.user.id });
+    const next = new Date();
+    Object.assign(cfg, payload, { enabled: true, startedAt: new Date(), nextRunAt: next });
+    // Initialize daily reference if needed
+    if (!cfg.dailyDate) cfg.dailyDate = new Date(new Date().setHours(0,0,0,0));
+    await cfg.save();
+    ok(res, { running: true, config: cfg, nextRunAt: cfg.nextRunAt }, "Autotrade started");
+  } catch (e) {
+    fail(res, { statusCode: 500, message: "Failed to start autotrade", error: e });
+  }
+};
+
+export const stopAutoTrade = async (req, res) => {
+  try {
+    const cfg = await AutoTradeConfig.findOne({ user: req.user.id });
+    if (cfg) { cfg.enabled = false; cfg.nextRunAt = null; cfg.lockedUntil = null; await cfg.save(); }
+    ok(res, { running: false, config: cfg || null }, "Autotrade stopped");
+  } catch (e) {
+    fail(res, { statusCode: 500, message: "Failed to stop autotrade", error: e });
   }
 };
 

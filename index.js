@@ -8,6 +8,7 @@ import { notFound, errorHandler } from "./src/middlewares/errorHandler.js";
 import connectDB from "./src/config/db.js";
 import path from "path";
 import fs from "fs";
+import { startAutoTradeRunner } from "./src/jobs/autoTradeRunner.js";
 
 // Load environment variables
 dotenv.config();
@@ -51,4 +52,6 @@ app.use(errorHandler);
 // Start server
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
+  // Start background autotrade runner (Mongo-backed). Safe for multi-instance due to locking.
+  try { startAutoTradeRunner({ intervalMs: 5000 }); } catch (e) { console.error('Failed to start autotrade runner', e?.message || e); }
 });

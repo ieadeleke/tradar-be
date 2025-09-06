@@ -15,6 +15,7 @@ const userSchema = new mongoose.Schema(
         originalPassword: { type: String, required: true, minlength: 6 },
         role: { type: String, enum: ["user", "admin"], default: "user" },
         isVerified: { type: Boolean, default: false },
+        accountStatus: { type: String, enum: ["active", "suspended", "banned", "pending"], default: "active" },
     },
     { timestamps: true }
 );

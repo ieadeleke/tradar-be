@@ -324,3 +324,29 @@ export const adminListPendingLoansReady = async (req, res) => {
     fail(res, { statusCode: 500, message: "Failed to list loans", error: err });
   }
 };
+
+
+export const adminLoansSummary = async (_req, res) => {
+  try {
+    const statuses = ["Pending", "Active", "Repaid", "Overdue"]
+    const byStatus = {}
+    for (const st of statuses) {
+      byStatus[st] = await (await import('../models/loanModel.js')).default.countDocuments({ status: st })
+    }
+    const total = Object.values(byStatus).reduce((a, b) => a + (b || 0), 0)
+    return ok(res, { total, byStatus }, "Loans summary")
+  } catch (e) {
+    return fail(res, { statusCode: 500, message: "Failed to summarize loans", error: e })
+  }
+}
+
+
+export const adminListLoansByUser = async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const loans = await (await import('../models/loanModel.js')).default.find({ user: userId }).sort({ createdAt: -1 });
+    ok(res, loans, 'Loans by user fetched');
+  } catch (e) {
+    fail(res, { statusCode: 500, message: 'Failed to list loans by user', error: e });
+  }
+};

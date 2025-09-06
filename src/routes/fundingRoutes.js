@@ -88,6 +88,18 @@ router.get("/requests", protect, admin, async (req, res) => {
   }
 });
 
+// Admin: list funding requests for a specific user
+router.get("/user/:userId", protect, admin, async (req, res) => {
+  try {
+    const { userId } = req.params
+    const list = await Funding.find({ user: userId }).sort({ createdAt: -1 })
+    return ok(res, list, "User funding requests")
+  } catch (e) {
+    console.error("[funding/user]", e)
+    return fail(res, { statusCode: 500, message: "Failed to list user funding", error: e })
+  }
+});
+
 // Admin: approve and credit wallet
 router.post("/:id/approve", protect, admin, async (req, res) => {
   try {

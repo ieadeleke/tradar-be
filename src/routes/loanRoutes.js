@@ -1,5 +1,5 @@
 import express from "express";
-import { getLoans, requestLoan, repayLoan, adminRequestDocuments, adminRequestDownPayment, getDocumentUploadUrl, confirmDocumentUpload, adminVerifyDocument, recordDownPayment, adminApproveLoan, getLoanDocuments, adminListPendingLoansReady } from "../controllers/loanController.js";
+import { getLoans, requestLoan, repayLoan, adminRequestDocuments, adminRequestDownPayment, getDocumentUploadUrl, confirmDocumentUpload, adminVerifyDocument, recordDownPayment, adminApproveLoan, getLoanDocuments, adminListPendingLoansReady, adminLoansSummary, adminListLoansByUser } from "../controllers/loanController.js";
 import { protect } from "../middlewares/authMiddleware.js";
 import { admin } from "../middlewares/adminMiddleware.js";
 
@@ -7,6 +7,8 @@ const router = express.Router();
 
 // Fixed admin routes should be before dynamic :loanId routes
 router.get("/admin/pending-ready", protect, admin, adminListPendingLoansReady);
+router.get("/admin/by-user/:userId", protect, admin, adminListLoansByUser);
+router.get("/admin/summary", protect, admin, adminLoansSummary);
 
 router.get("/", protect, getLoans);
 router.post("/request", protect, requestLoan);
